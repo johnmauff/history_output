@@ -441,6 +441,7 @@ contains
          select type(buff_ptr)
          class is (hist_buff_1d_t)
             buff => buff_ptr
+            call buff%sync_host()
             call buff%norm_value(norm_val, field%flag_xyfill(), &
                     field%fill_value())
             call hist_add_message(subname, VERBOSE,                   &
@@ -479,6 +480,7 @@ contains
          select type(buff_ptr)
          class is (hist_buff_2d_t)
             buff => buff_ptr
+            call buff%sync_host()
             call buff%norm_value(norm_val, field%flag_xyfill(), &
                     field%fill_value())
             call hist_add_message(subname, VERBOSE,                   &
@@ -517,6 +519,7 @@ contains
          select type(buff_ptr)
          class is (hist_buff_3d_t)
             buff => buff_ptr
+            call buff%sync_host()
             call buff%norm_value(norm_val, field%flag_xyfill(), &
                     field%fill_value())
             call hist_add_message(subname, VERBOSE,                   &
@@ -555,6 +558,7 @@ contains
          select type(buff_ptr)
          class is (hist_buff_1d_t)
             buff => buff_ptr
+            call buff%sync_host()
             val = buff%data
          class default
             call hist_add_error(subname, 'invalid buffer type', errors=logger)
@@ -587,6 +591,7 @@ contains
          select type(buff_ptr)
          class is (hist_buff_2d_t)
             buff => buff_ptr
+            call buff%sync_host()
             val = buff%data
          class default
             call hist_add_error(subname, 'invalid buffer type', errors=logger)
@@ -619,6 +624,7 @@ contains
          select type(buff_ptr)
          class is (hist_buff_3d_t)
             buff => buff_ptr
+            call buff%sync_host()
             val = buff%data
          class default
             call hist_add_error(subname, 'invalid buffer type', errors=logger)
@@ -651,6 +657,7 @@ contains
          select type(buff_ptr)
          class is (hist_buff_1d_t)
             buff => buff_ptr
+            call buff%sync_host()
             call buff%get_var_buffer(var_buffer)
          class default
             call hist_add_error(subname, 'invalid buffer type', errors=logger)
@@ -683,6 +690,7 @@ contains
          select type(buff_ptr)
          class is (hist_buff_2d_t)
             buff => buff_ptr
+            call buff%sync_host()
             call buff%get_var_buffer(var_buffer)
          class default
             call hist_add_error(subname, 'invalid buffer type', errors=logger)
@@ -715,6 +723,7 @@ contains
          select type(buff_ptr)
          class is (hist_buff_3d_t)
             buff => buff_ptr
+            call buff%sync_host()
             call buff%get_var_buffer(var_buffer)
          class default
             call hist_add_error(subname, 'invalid buffer type', errors=logger)
@@ -739,6 +748,7 @@ contains
 
       buff_ptr => field%buffers
       if (associated(buff_ptr)) then
+         call buff_ptr%sync_host()
          samples =  buff_ptr%get_num_samples(logger)
       end if
 

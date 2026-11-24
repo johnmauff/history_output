@@ -460,6 +460,8 @@ contains
          next_buf => this%buffers
          if (associated(next_buf)) then
             this%buffers => next_buf%next
+            ! Device copies first (OpenACC builds; no-op otherwise)
+            call next_buf%device_release()
             deallocate(next_buf)
          else
             exit

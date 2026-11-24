@@ -1,6 +1,18 @@
 module hist_buffer
+   ! Device residency (OpenACC builds only): when this file is compiled with
+   ! OpenACC, every buffer's arrays (data, num_samples, var_buffer) are
+   ! created on the device when first allocated and accumulated there. The
+   ! input field may be on the device (accumulated in place) or on the host
+   ! (copied in for the call). The host copies are brought up to date only
+   ! by sync_host, which the hist_api read routines call before reading.
+   ! Device kernels are plain-array routines with the host arithmetic and
+   ! order, so results are bit-for-bit identical. Without OpenACC nothing
+   ! changes.
    use, intrinsic :: ISO_FORTRAN_ENV, only: REAL64
    use hist_hashable,                 only: hist_hashable_t
+#ifdef _OPENACC
+   use openacc,                       only: acc_is_present
+#endif
 
    implicit none
    private
@@ -43,6 +55,8 @@ module hist_buffer
       integer,                allocatable, private :: block_ends(:)
       integer,                allocatable, private :: num_samples(:)
       character(len=:),       allocatable, private :: buff_type
+      ! .true. once the buffer's arrays have device copies (OpenACC builds)
+      logical,                             private :: on_device = .false.
       class(hist_buffer_t),   pointer              :: next => null()
    contains
       procedure                              :: field  => get_field_info
@@ -56,8 +70,11 @@ module hist_buffer
       procedure                              :: has_blocks
       procedure                              :: get_num_samples
       procedure                              :: set_num_samples
+      procedure                              :: is_on_device
       procedure(hist_buff_clear),   deferred :: clear
       procedure(hist_buff_init),    deferred :: initialize
+      procedure(hist_buff_dev),     deferred :: sync_host
+      procedure(hist_buff_dev),     deferred :: device_release
    end type hist_buffer_t
 
    type, public, extends(hist_buffer_t) :: hist_buff_1d_t
@@ -68,6 +85,8 @@ module hist_buffer
       procedure :: accumulate => buff_1d_accum
       procedure :: norm_value => buff_1d_value
       procedure :: initialize => init_buff_1d
+      procedure :: sync_host => buff_1d_sync_host
+      procedure :: device_release => buff_1d_device_release
       procedure :: get_var_buffer => get_var_buffer_1d
       procedure :: set_field_buffer => set_field_buffer_1d
       procedure :: set_var_buffer => set_var_buffer_1d
@@ -81,6 +100,8 @@ module hist_buffer
       procedure :: accumulate => buff_2d_accum
       procedure :: norm_value => buff_2d_value
       procedure :: initialize => init_buff_2d
+      procedure :: sync_host => buff_2d_sync_host
+      procedure :: device_release => buff_2d_device_release
       procedure :: check_fill_value => buff_2d_check_fill
       procedure :: get_var_buffer => get_var_buffer_2d
       procedure :: set_field_buffer => set_field_buffer_2d
@@ -95,6 +116,8 @@ module hist_buffer
       procedure :: accumulate => buff_3d_accum
       procedure :: norm_value => buff_3d_value
       procedure :: initialize => init_buff_3d
+      procedure :: sync_host => buff_3d_sync_host
+      procedure :: device_release => buff_3d_device_release
       procedure :: check_fill_value => buff_3d_check_fill
       procedure :: get_var_buffer => get_var_buffer_3d
       procedure :: set_field_buffer => set_field_buffer_3d
@@ -141,6 +164,36 @@ module hist_buffer
          type(hist_log_messages), optional, intent(inout) :: logger
       end subroutine hist_buff_clear
    end interface
+
+   abstract interface
+      subroutine hist_buff_dev(this)
+         import                  :: hist_buffer_t
+         implicit none
+         class(hist_buffer_t), intent(inout) :: this
+      end subroutine hist_buff_dev
+   end interface
+
+#ifdef _OPENACC
+   ! Plain-array device helpers (device code never indexes the buffer
+   ! types' allocatable components directly)
+   interface dev_create
+      module procedure dev_create_i1, dev_create_r1, dev_create_r2, dev_create_r3
+   end interface dev_create
+   interface dev_delete
+      module procedure dev_delete_i1, dev_delete_r1, dev_delete_r2, dev_delete_r3
+   end interface dev_delete
+   interface dev_update_self
+      module procedure dev_update_self_i1, dev_update_self_r1,                &
+           dev_update_self_r2, dev_update_self_r3
+   end interface dev_update_self
+   interface dev_update_device
+      module procedure dev_update_device_i1, dev_update_device_r1,            &
+           dev_update_device_r2, dev_update_device_r3
+   end interface dev_update_device
+   interface dev_zero
+      module procedure dev_zero_i1, dev_zero_r1, dev_zero_r2, dev_zero_r3
+   end interface dev_zero
+#endif
 
 contains
 
@@ -252,8 +305,23 @@ contains
       integer,                 intent(in) :: samples(:)
 
       this%num_samples = samples
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_update_device(this%num_samples)
+      end if
+#endif
 
    end subroutine set_num_samples
+
+   !#######################################################################
+
+   pure function is_on_device(this) result(on_dev)
+      ! .true. if the buffer's arrays are device-resident (OpenACC builds)
+      class(hist_buffer_t), intent(in) :: this
+      logical                          :: on_dev
+
+      on_dev = this%on_device
+   end function is_on_device
 
    !#######################################################################
 
@@ -362,6 +430,22 @@ contains
       if (allocated(this%var_buffer)) then
          this%var_buffer = 0.0_REAL64
       end if
+#ifdef _OPENACC
+      ! First clear: create the device copies; every clear: zero them too
+      if (.not. this%on_device) then
+         call dev_create(this%data)
+         call dev_create(this%num_samples)
+         if (allocated(this%var_buffer)) then
+            call dev_create(this%var_buffer)
+         end if
+         this%on_device = .true.
+      end if
+      call dev_zero(this%data)
+      call dev_zero(this%num_samples)
+      if (allocated(this%var_buffer)) then
+         call dev_zero(this%var_buffer)
+      end if
+#endif
 
    end subroutine buff_1d_clear
 
@@ -421,6 +505,14 @@ contains
                  this%field_shape(this%horiz_axis_ind) - 1
          end if
       end if
+
+#ifdef _OPENACC
+      if (this%on_device) then
+         call buff_1d_accum_device(this, field, col_beg_use, col_end_use, &
+              flag_xyfill, fill_value, logger)
+         return
+      end if
+#endif
 
       select case (this%accum_type)
       case (hist_accum_lst)
@@ -637,6 +729,22 @@ contains
       if (allocated(this%var_buffer)) then
          this%var_buffer = 0.0_REAL64
       end if
+#ifdef _OPENACC
+      ! First clear: create the device copies; every clear: zero them too
+      if (.not. this%on_device) then
+         call dev_create(this%data)
+         call dev_create(this%num_samples)
+         if (allocated(this%var_buffer)) then
+            call dev_create(this%var_buffer)
+         end if
+         this%on_device = .true.
+      end if
+      call dev_zero(this%data)
+      call dev_zero(this%num_samples)
+      if (allocated(this%var_buffer)) then
+         call dev_zero(this%var_buffer)
+      end if
+#endif
 
    end subroutine buff_2d_clear
 
@@ -698,6 +806,14 @@ contains
                  this%field_shape(this%horiz_axis_ind) - 1
          end if
       end if
+
+#ifdef _OPENACC
+      if (this%on_device) then
+         call buff_2d_accum_device(this, field, col_beg_use, col_end_use, &
+              flag_xyfill, fill_value, logger)
+         return
+      end if
+#endif
 
       select case (this%accum_type)
       case (hist_accum_lst)
@@ -969,6 +1085,22 @@ contains
       if (allocated(this%var_buffer)) then
          this%var_buffer = 0.0_REAL64
       end if
+#ifdef _OPENACC
+      ! First clear: create the device copies; every clear: zero them too
+      if (.not. this%on_device) then
+         call dev_create(this%data)
+         call dev_create(this%num_samples)
+         if (allocated(this%var_buffer)) then
+            call dev_create(this%var_buffer)
+         end if
+         this%on_device = .true.
+      end if
+      call dev_zero(this%data)
+      call dev_zero(this%num_samples)
+      if (allocated(this%var_buffer)) then
+         call dev_zero(this%var_buffer)
+      end if
+#endif
 
    end subroutine buff_3d_clear
 
@@ -1030,6 +1162,14 @@ contains
                  this%field_shape(this%horiz_axis_ind) - 1
          end if
       end if
+
+#ifdef _OPENACC
+      if (this%on_device) then
+         call buff_3d_accum_device(this, field, col_beg_use, col_end_use, &
+              flag_xyfill, fill_value, logger)
+         return
+      end if
+#endif
 
       select case (this%accum_type)
       case (hist_accum_lst)
@@ -1314,6 +1454,11 @@ contains
       real(REAL64),             intent(in) :: field_buff(:)
 
       this%data = field_buff
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_update_device(this%data)
+      end if
+#endif
    end subroutine set_field_buffer_1d
 
    !#######################################################################
@@ -1323,6 +1468,11 @@ contains
       real(REAL64),             intent(in) :: field_buff(:,:)
 
       this%data = field_buff
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_update_device(this%data)
+      end if
+#endif
    end subroutine set_field_buffer_2d
 
    !#######################################################################
@@ -1332,6 +1482,11 @@ contains
       real(REAL64),             intent(in) :: field_buff(:,:,:)
 
       this%data = field_buff
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_update_device(this%data)
+      end if
+#endif
    end subroutine set_field_buffer_3d
 
    !#######################################################################
@@ -1341,6 +1496,11 @@ contains
       real(REAL64),             intent(in) :: var_buff(:)
 
       this%var_buffer = var_buff
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_update_device(this%var_buffer)
+      end if
+#endif
    end subroutine set_var_buffer_1d
 
    !#######################################################################
@@ -1350,6 +1510,11 @@ contains
       real(REAL64),             intent(in) :: var_buff(:,:)
 
       this%var_buffer = var_buff
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_update_device(this%var_buffer)
+      end if
+#endif
    end subroutine set_var_buffer_2d
 
    !#######################################################################
@@ -1359,7 +1524,1005 @@ contains
       real(REAL64),             intent(in) :: var_buff(:,:,:)
 
       this%var_buffer = var_buff
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_update_device(this%var_buffer)
+      end if
+#endif
    end subroutine set_var_buffer_3d
+
+   !#######################################################################
+
+   subroutine buff_1d_sync_host(this)
+      ! Bring the host copies of the buffer up to date (no-op unless the
+      ! buffer is device-resident). Called before any host read.
+      class(hist_buff_1d_t), intent(inout) :: this
+
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_update_self(this%data)
+         call dev_update_self(this%num_samples)
+         if (allocated(this%var_buffer)) then
+            call dev_update_self(this%var_buffer)
+         end if
+      end if
+#endif
+   end subroutine buff_1d_sync_host
+
+   !#######################################################################
+
+   subroutine buff_1d_device_release(this)
+      ! Delete the device copies (before the buffer is deallocated)
+      class(hist_buff_1d_t), intent(inout) :: this
+
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_delete(this%data)
+         call dev_delete(this%num_samples)
+         if (allocated(this%var_buffer)) then
+            call dev_delete(this%var_buffer)
+         end if
+         this%on_device = .false.
+      end if
+#endif
+   end subroutine buff_1d_device_release
+
+   !#######################################################################
+
+   subroutine buff_2d_sync_host(this)
+      ! Bring the host copies of the buffer up to date (no-op unless the
+      ! buffer is device-resident). Called before any host read.
+      class(hist_buff_2d_t), intent(inout) :: this
+
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_update_self(this%data)
+         call dev_update_self(this%num_samples)
+         if (allocated(this%var_buffer)) then
+            call dev_update_self(this%var_buffer)
+         end if
+      end if
+#endif
+   end subroutine buff_2d_sync_host
+
+   !#######################################################################
+
+   subroutine buff_2d_device_release(this)
+      ! Delete the device copies (before the buffer is deallocated)
+      class(hist_buff_2d_t), intent(inout) :: this
+
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_delete(this%data)
+         call dev_delete(this%num_samples)
+         if (allocated(this%var_buffer)) then
+            call dev_delete(this%var_buffer)
+         end if
+         this%on_device = .false.
+      end if
+#endif
+   end subroutine buff_2d_device_release
+
+   !#######################################################################
+
+   subroutine buff_3d_sync_host(this)
+      ! Bring the host copies of the buffer up to date (no-op unless the
+      ! buffer is device-resident). Called before any host read.
+      class(hist_buff_3d_t), intent(inout) :: this
+
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_update_self(this%data)
+         call dev_update_self(this%num_samples)
+         if (allocated(this%var_buffer)) then
+            call dev_update_self(this%var_buffer)
+         end if
+      end if
+#endif
+   end subroutine buff_3d_sync_host
+
+   !#######################################################################
+
+   subroutine buff_3d_device_release(this)
+      ! Delete the device copies (before the buffer is deallocated)
+      class(hist_buff_3d_t), intent(inout) :: this
+
+#ifdef _OPENACC
+      if (this%on_device) then
+         call dev_delete(this%data)
+         call dev_delete(this%num_samples)
+         if (allocated(this%var_buffer)) then
+            call dev_delete(this%var_buffer)
+         end if
+         this%on_device = .false.
+      end if
+#endif
+   end subroutine buff_3d_device_release
+
+#ifdef _OPENACC
+   !#######################################################################
+
+   subroutine buff_1d_accum_device(this, field, col_beg, col_end,           &
+        flag_xyfill, fill_value, logger)
+      ! Device version of buff_1d_accum: same arithmetic and order. A host
+      ! <field> is copied to the device for the call.
+      use hist_msg_handler, only: hist_log_messages, hist_add_error, error_length
+      ! Dummy arguments
+      class(hist_buff_1d_t),            intent(inout) :: this
+      real(REAL64),                      intent(in)    :: field(:)
+      integer,                           intent(in)    :: col_beg
+      integer,                           intent(in)    :: col_end
+      logical,                           intent(in)    :: flag_xyfill
+      real(REAL64),                      intent(in)    :: fill_value
+      type(hist_log_messages), optional, intent(inout) :: logger
+      ! Local variables
+      logical                     :: field_on_device
+      integer                     :: bad_col
+      character(len=error_length) :: errmsg
+      character(len=512)          :: errstr
+
+      if ((this%accum_type < hist_accum_lst) .or.                             &
+           (this%accum_type > hist_accum_var)) then
+         ! This shouldn't trigger, so raise an error:
+         write(errmsg, *) 'un-recognized accumulation type: ', this%accum_type
+         call hist_add_error('buff_1d_accum', errmsg, errors=logger)
+         return
+      end if
+      field_on_device = acc_is_present(field)
+      if (.not. field_on_device) then
+         !$acc enter data copyin(field)
+      end if
+      if (this%accum_type == hist_accum_var) then
+         call accum_var_1d_dev(this%data, this%var_buffer, this%num_samples, &
+              field, col_beg, col_end, flag_xyfill, fill_value)
+      else
+         call accum_1d_dev(this%accum_type, this%data, this%num_samples,     &
+              field, col_beg, col_end, flag_xyfill, fill_value)
+      end if
+      if (.not. field_on_device) then
+         !$acc exit data delete(field)
+      end if
+
+   end subroutine buff_1d_accum_device
+
+   !#######################################################################
+
+   subroutine buff_2d_accum_device(this, field, col_beg, col_end,           &
+        flag_xyfill, fill_value, logger)
+      ! Device version of buff_2d_accum: same arithmetic and order. A host
+      ! <field> is copied to the device for the call.
+      use hist_msg_handler, only: hist_log_messages, hist_add_error, error_length
+      ! Dummy arguments
+      class(hist_buff_2d_t),            intent(inout) :: this
+      real(REAL64),                      intent(in)    :: field(:,:)
+      integer,                           intent(in)    :: col_beg
+      integer,                           intent(in)    :: col_end
+      logical,                           intent(in)    :: flag_xyfill
+      real(REAL64),                      intent(in)    :: fill_value
+      type(hist_log_messages), optional, intent(inout) :: logger
+      ! Local variables
+      logical                     :: field_on_device
+      integer                     :: bad_col
+      character(len=error_length) :: errmsg
+      character(len=512)          :: errstr
+
+      if ((this%accum_type < hist_accum_lst) .or.                             &
+           (this%accum_type > hist_accum_var)) then
+         ! This shouldn't trigger, so raise an error:
+         write(errmsg, *) 'un-recognized accumulation type: ', this%accum_type
+         call hist_add_error('buff_2d_accum', errmsg, errors=logger)
+         return
+      end if
+      field_on_device = acc_is_present(field)
+      if (.not. field_on_device) then
+         !$acc enter data copyin(field)
+      end if
+      if (this%accum_type == hist_accum_var) then
+         call accum_var_2d_dev(this%data, this%var_buffer, this%num_samples, &
+              field, col_beg, col_end, this%field_shape(2), flag_xyfill, fill_value)
+      else
+         call accum_2d_dev(this%accum_type, this%data, this%num_samples,     &
+              field, col_beg, col_end, this%field_shape(2), flag_xyfill, fill_value)
+      end if
+      if (flag_xyfill) then
+         ! Same check as buff_2d_check_fill, as a device reduction
+         call check_fill_2d_dev(field, fill_value, bad_col)
+         if (bad_col > 0) then
+            write(errstr, '(a,i0)') 'ERROR: fill value applied inconsistently for column ', bad_col
+            call hist_add_error('buff_2d_check_fill', errstr, errors=logger)
+         end if
+      end if
+      if (.not. field_on_device) then
+         !$acc exit data delete(field)
+      end if
+
+   end subroutine buff_2d_accum_device
+
+   !#######################################################################
+
+   subroutine buff_3d_accum_device(this, field, col_beg, col_end,           &
+        flag_xyfill, fill_value, logger)
+      ! Device version of buff_3d_accum: same arithmetic and order. A host
+      ! <field> is copied to the device for the call.
+      use hist_msg_handler, only: hist_log_messages, hist_add_error, error_length
+      ! Dummy arguments
+      class(hist_buff_3d_t),            intent(inout) :: this
+      real(REAL64),                      intent(in)    :: field(:,:,:)
+      integer,                           intent(in)    :: col_beg
+      integer,                           intent(in)    :: col_end
+      logical,                           intent(in)    :: flag_xyfill
+      real(REAL64),                      intent(in)    :: fill_value
+      type(hist_log_messages), optional, intent(inout) :: logger
+      ! Local variables
+      logical                     :: field_on_device
+      integer                     :: bad_col
+      character(len=error_length) :: errmsg
+      character(len=512)          :: errstr
+
+      if ((this%accum_type < hist_accum_lst) .or.                             &
+           (this%accum_type > hist_accum_var)) then
+         ! This shouldn't trigger, so raise an error:
+         write(errmsg, *) 'un-recognized accumulation type: ', this%accum_type
+         call hist_add_error('buff_3d_accum', errmsg, errors=logger)
+         return
+      end if
+      field_on_device = acc_is_present(field)
+      if (.not. field_on_device) then
+         !$acc enter data copyin(field)
+      end if
+      if (this%accum_type == hist_accum_var) then
+         call accum_var_3d_dev(this%data, this%var_buffer, this%num_samples, &
+              field, col_beg, col_end, this%field_shape(2), this%field_shape(3), flag_xyfill, fill_value)
+      else
+         call accum_3d_dev(this%accum_type, this%data, this%num_samples,     &
+              field, col_beg, col_end, this%field_shape(2), this%field_shape(3), flag_xyfill, fill_value)
+      end if
+      if (flag_xyfill) then
+         ! Same check as buff_3d_check_fill, as a device reduction
+         call check_fill_3d_dev(field, fill_value, bad_col)
+         if (bad_col > 0) then
+            write(errstr, '(a,i0)') 'ERROR: fill value applied inconsistently for column ', bad_col
+            call hist_add_error('buff_3d_check_fill', errstr, errors=logger)
+         end if
+      end if
+      if (.not. field_on_device) then
+         !$acc exit data delete(field)
+      end if
+
+   end subroutine buff_3d_accum_device
+
+   !#######################################################################
+
+   subroutine accum_1d_dev(accum_type, data, num_samples, field, col_beg,  &
+        col_end, flag_xyfill, fill_value)
+      ! lst/min/max/avg accumulation on the device (see buff_1d_accum)
+      integer,      intent(in)    :: accum_type
+      real(REAL64), intent(inout) :: data(:)
+      integer,      intent(inout) :: num_samples(:)
+      real(REAL64), intent(in)    :: field(:)
+      integer,      intent(in)    :: col_beg
+      integer,      intent(in)    :: col_end
+      logical,      intent(in)    :: flag_xyfill
+      real(REAL64), intent(in)    :: fill_value
+      integer      :: i, ic
+      real(REAL64) :: fld_val
+
+      select case (accum_type)
+      case (hist_accum_lst)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            fld_val = field(ic)
+            if (flag_xyfill .and. fld_val == fill_value) then
+               data(i) = fill_value
+               num_samples(i) = 0
+            else
+               data(i) = fld_val
+               num_samples(i) = 1
+            end if
+         end do
+      case (hist_accum_min)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            fld_val = field(ic)
+            if (flag_xyfill) then
+               if (num_samples(i) == 0) then
+                  if (fld_val /= fill_value) then
+                     data(i) = fld_val
+                     num_samples(i) = 1
+                  else
+                     data(i) = HUGE(REAL64)
+                  end if
+               else if (fld_val < data(i) .and. fld_val /= fill_value) then
+                  data(i) = fld_val
+                  num_samples(i) = 1
+               end if
+            else
+               if (num_samples(i) == 0 .or. fld_val < data(i)) then
+                  data(i) = fld_val
+                  num_samples(i) = 1
+               end if
+            end if
+         end do
+      case (hist_accum_max)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            fld_val = field(ic)
+            if (flag_xyfill) then
+               if (num_samples(i) == 0) then
+                  if (fld_val /= fill_value) then
+                     data(i) = fld_val
+                     num_samples(i) = 1
+                  else
+                     data(i) = -HUGE(REAL64)
+                  end if
+               else if (fld_val > data(i) .and. fld_val /= fill_value) then
+                  data(i) = fld_val
+                  num_samples(i) = 1
+               end if
+            else
+               if (num_samples(i) == 0 .or. fld_val > data(i)) then
+                  data(i) = fld_val
+                  num_samples(i) = 1
+               end if
+            end if
+         end do
+      case (hist_accum_avg)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            fld_val = field(ic)
+            if (flag_xyfill) then
+               if (fld_val /= fill_value) then
+                  data(i) = data(i) + fld_val
+                  num_samples(i) = num_samples(i) + 1
+               end if
+            else
+               data(i) = data(i) + fld_val
+               num_samples(i) = num_samples(i) + 1
+            end if
+         end do
+      end select
+
+   end subroutine accum_1d_dev
+
+   !#######################################################################
+
+   subroutine accum_2d_dev(accum_type, data, num_samples, field, col_beg,  &
+        col_end, n2, flag_xyfill, fill_value)
+      ! lst/min/max/avg accumulation on the device (see buff_2d_accum)
+      integer,      intent(in)    :: accum_type
+      real(REAL64), intent(inout) :: data(:,:)
+      integer,      intent(inout) :: num_samples(:)
+      real(REAL64), intent(in)    :: field(:,:)
+      integer,      intent(in)    :: col_beg
+      integer,      intent(in)    :: col_end
+      integer,      intent(in)    :: n2
+      logical,      intent(in)    :: flag_xyfill
+      real(REAL64), intent(in)    :: fill_value
+      integer      :: i, ic, k
+      real(REAL64) :: fld_val
+
+      select case (accum_type)
+      case (hist_accum_lst)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            if (flag_xyfill .and. field(ic, 1) == fill_value) then
+               num_samples(i) = 0
+            else
+               num_samples(i) = 1
+            end if
+            !$acc loop seq
+            do k = 1, n2
+               fld_val = field(ic, k)
+               if (flag_xyfill .and. fld_val == fill_value) then
+                  data(i, k) = fill_value
+               else
+                  data(i, k) = fld_val
+               end if
+            end do
+         end do
+      case (hist_accum_min)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            if (num_samples(i) == 0) then
+               if (.not. (flag_xyfill .and. field(ic, 1) == fill_value)) then
+                  !$acc loop seq
+                  do k = 1, n2
+                     data(i, k) = field(ic, k)
+                  end do
+                  num_samples(i) = 1
+               end if
+            else
+               !$acc loop seq
+               do k = 1, n2
+                  fld_val = field(ic, k)
+                  if (flag_xyfill) then
+                     if (fld_val < data(i, k) .and. fld_val /= fill_value) then
+                        data(i, k) = fld_val
+                     end if
+                  else
+                     if (fld_val < data(i, k)) then
+                        data(i, k) = fld_val
+                     end if
+                  end if
+               end do
+            end if
+         end do
+      case (hist_accum_max)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            if (num_samples(i) == 0) then
+               if (.not. (flag_xyfill .and. field(ic, 1) == fill_value)) then
+                  !$acc loop seq
+                  do k = 1, n2
+                     data(i, k) = field(ic, k)
+                  end do
+                  num_samples(i) = 1
+               end if
+            else
+               !$acc loop seq
+               do k = 1, n2
+                  fld_val = field(ic, k)
+                  if (flag_xyfill) then
+                     if (fld_val > data(i, k) .and. fld_val /= fill_value) then
+                        data(i, k) = fld_val
+                     end if
+                  else
+                     if (fld_val > data(i, k)) then
+                        data(i, k) = fld_val
+                     end if
+                  end if
+               end do
+            end if
+         end do
+      case (hist_accum_avg)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            if (.not. (flag_xyfill .and. field(ic, 1) == fill_value)) then
+               num_samples(i) = num_samples(i) + 1
+            end if
+            !$acc loop seq
+            do k = 1, n2
+               fld_val = field(ic, k)
+               if (flag_xyfill) then
+                  if (fld_val /= fill_value) then
+                     data(i, k) = data(i, k) + fld_val
+                  end if
+               else
+                  data(i, k) = data(i, k) + fld_val
+               end if
+            end do
+         end do
+      end select
+
+   end subroutine accum_2d_dev
+
+   !#######################################################################
+
+   subroutine accum_3d_dev(accum_type, data, num_samples, field, col_beg,  &
+        col_end, n2, n3, flag_xyfill, fill_value)
+      ! lst/min/max/avg accumulation on the device (see buff_3d_accum)
+      integer,      intent(in)    :: accum_type
+      real(REAL64), intent(inout) :: data(:,:,:)
+      integer,      intent(inout) :: num_samples(:)
+      real(REAL64), intent(in)    :: field(:,:,:)
+      integer,      intent(in)    :: col_beg
+      integer,      intent(in)    :: col_end
+      integer,      intent(in)    :: n2, n3
+      logical,      intent(in)    :: flag_xyfill
+      real(REAL64), intent(in)    :: fill_value
+      integer      :: i, ic, k, m
+      real(REAL64) :: fld_val
+
+      select case (accum_type)
+      case (hist_accum_lst)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            if (flag_xyfill .and. field(ic, 1, 1) == fill_value) then
+               num_samples(i) = 0
+            else
+               num_samples(i) = 1
+            end if
+            !$acc loop seq
+            do k = 1, n2
+               !$acc loop seq
+               do m = 1, n3
+                  fld_val = field(ic, k, m)
+                  if (flag_xyfill .and. fld_val == fill_value) then
+                     data(i, k, m) = fill_value
+                  else
+                     data(i, k, m) = fld_val
+                  end if
+               end do
+            end do
+         end do
+      case (hist_accum_min)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            if (num_samples(i) == 0) then
+               if (.not. (flag_xyfill .and. field(ic, 1, 1) == fill_value)) then
+                  !$acc loop seq
+                  do k = 1, n2
+                     !$acc loop seq
+                     do m = 1, n3
+                        data(i, k, m) = field(ic, k, m)
+                     end do
+                  end do
+                  num_samples(i) = 1
+               end if
+            else
+               !$acc loop seq
+               do k = 1, n2
+                  !$acc loop seq
+                  do m = 1, n3
+                     fld_val = field(ic, k, m)
+                     if (flag_xyfill) then
+                        if (fld_val < data(i, k, m) .and. fld_val /= fill_value) then
+                           data(i, k, m) = fld_val
+                        end if
+                     else
+                        if (fld_val < data(i, k, m)) then
+                           data(i, k, m) = fld_val
+                        end if
+                     end if
+                  end do
+               end do
+            end if
+         end do
+      case (hist_accum_max)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            if (num_samples(i) == 0) then
+               if (.not. (flag_xyfill .and. field(ic, 1, 1) == fill_value)) then
+                  !$acc loop seq
+                  do k = 1, n2
+                     !$acc loop seq
+                     do m = 1, n3
+                        data(i, k, m) = field(ic, k, m)
+                     end do
+                  end do
+                  num_samples(i) = 1
+               end if
+            else
+               !$acc loop seq
+               do k = 1, n2
+                  !$acc loop seq
+                  do m = 1, n3
+                     fld_val = field(ic, k, m)
+                     if (flag_xyfill) then
+                        if (fld_val > data(i, k, m) .and. fld_val /= fill_value) then
+                           data(i, k, m) = fld_val
+                        end if
+                     else
+                        if (fld_val > data(i, k, m)) then
+                           data(i, k, m) = fld_val
+                        end if
+                     end if
+                  end do
+               end do
+            end if
+         end do
+      case (hist_accum_avg)
+         !$acc parallel loop gang vector private(ic, fld_val) &
+         !$acc   present(data, num_samples, field)
+         do i = col_beg, col_end
+            ic = i - col_beg + 1
+            if (.not. (flag_xyfill .and. field(ic, 1, 1) == fill_value)) then
+               num_samples(i) = num_samples(i) + 1
+            end if
+            !$acc loop seq
+            do k = 1, n2
+               !$acc loop seq
+               do m = 1, n3
+                  fld_val = field(ic, k, m)
+                  if (flag_xyfill) then
+                     if (fld_val /= fill_value) then
+                        data(i, k, m) = data(i, k, m) + fld_val
+                     end if
+                  else
+                     data(i, k, m) = data(i, k, m) + fld_val
+                  end if
+               end do
+            end do
+         end do
+      end select
+
+   end subroutine accum_3d_dev
+
+   !#######################################################################
+
+   subroutine accum_var_1d_dev(data, var_buffer, num_samples, field,       &
+        col_beg, col_end, flag_xyfill, fill_value)
+      ! Standard deviation (Welford) on the device (see buff_1d_accum)
+      real(REAL64), intent(inout) :: data(:)
+      real(REAL64), intent(inout) :: var_buffer(:)
+      integer,      intent(inout) :: num_samples(:)
+      real(REAL64), intent(in)    :: field(:)
+      integer,      intent(in)    :: col_beg
+      integer,      intent(in)    :: col_end
+      logical,      intent(in)    :: flag_xyfill
+      real(REAL64), intent(in)    :: fill_value
+      integer      :: i, ic
+      real(REAL64) :: fld_val, tmp
+
+      !$acc parallel loop gang vector private(ic, fld_val, tmp) &
+      !$acc   present(data, var_buffer, num_samples, field)
+      do i = col_beg, col_end
+         ic = i - col_beg + 1
+         fld_val = field(ic)
+         if (flag_xyfill) then
+            if (fld_val /= fill_value) then
+               if (num_samples(i) == 0) then
+                  data(i) = fld_val
+                  var_buffer(i) = 0.0_REAL64
+                  num_samples(i) = num_samples(i) + 1
+               else
+                  tmp = data(i)
+                  num_samples(i) = num_samples(i) + 1
+                  data(i) = data(i) + &
+                          (fld_val - data(i)) / &
+                          num_samples(i)
+                  var_buffer(i) = var_buffer(i) + &
+                          (fld_val - data(i)) * &
+                          (fld_val - tmp)
+               end if
+            end if
+         else
+            if (num_samples(i) == 0) then
+               data(i) = fld_val
+               var_buffer(i) = 0.0_REAL64
+               num_samples(i) = num_samples(i) + 1
+            else
+               tmp = data(i)
+               num_samples(i) = num_samples(i) + 1
+               data(i) = data(i) + &
+                       (fld_val - data(i)) / &
+                       num_samples(i)
+               var_buffer(i) = var_buffer(i) + &
+                       (fld_val - data(i)) * &
+                       (fld_val - tmp)
+            end if
+         end if
+      end do
+
+   end subroutine accum_var_1d_dev
+
+   !#######################################################################
+
+   subroutine accum_var_2d_dev(data, var_buffer, num_samples, field,       &
+        col_beg, col_end, n2, flag_xyfill, fill_value)
+      ! Standard deviation (Welford) on the device (see buff_2d_accum)
+      real(REAL64), intent(inout) :: data(:,:)
+      real(REAL64), intent(inout) :: var_buffer(:,:)
+      integer,      intent(inout) :: num_samples(:)
+      real(REAL64), intent(in)    :: field(:,:)
+      integer,      intent(in)    :: col_beg
+      integer,      intent(in)    :: col_end
+      integer,      intent(in)    :: n2
+      logical,      intent(in)    :: flag_xyfill
+      real(REAL64), intent(in)    :: fill_value
+      integer      :: i, ic, k
+      real(REAL64) :: fld_val, tmp
+
+      !$acc parallel loop gang vector private(ic, fld_val, tmp) &
+      !$acc   present(data, var_buffer, num_samples, field)
+      do i = col_beg, col_end
+         ic = i - col_beg + 1
+         if (.not. (flag_xyfill .and. field(ic, 1) == fill_value)) then
+            num_samples(i) = num_samples(i) + 1
+         end if
+         !$acc loop seq
+         do k = 1, n2
+            fld_val = field(ic, k)
+            if (flag_xyfill) then
+               if (fld_val /= fill_value) then
+                  if (num_samples(i) == 1) then
+                     data(i, k) = fld_val
+                     var_buffer(i, k) = 0.0_REAL64
+                  else
+                     tmp = data(i, k)
+                     data(i, k) = data(i, k) + &
+                             (fld_val - data(i, k)) / &
+                             num_samples(i)
+                     var_buffer(i, k) = var_buffer(i, k) + &
+                             (fld_val - data(i, k)) * &
+                             (fld_val - tmp)
+                  end if
+               end if
+            else
+               if (num_samples(i) == 1) then
+                  data(i, k) = fld_val
+                  var_buffer(i, k) = 0.0_REAL64
+               else
+                  tmp = data(i, k)
+                  data(i, k) = data(i, k) + &
+                          (fld_val - data(i, k)) / &
+                          num_samples(i)
+                  var_buffer(i, k) = var_buffer(i, k) + &
+                          (fld_val - data(i, k)) * &
+                          (fld_val - tmp)
+               end if
+            end if
+         end do
+      end do
+
+   end subroutine accum_var_2d_dev
+
+   !#######################################################################
+
+   subroutine accum_var_3d_dev(data, var_buffer, num_samples, field,       &
+        col_beg, col_end, n2, n3, flag_xyfill, fill_value)
+      ! Standard deviation (Welford) on the device (see buff_3d_accum)
+      real(REAL64), intent(inout) :: data(:,:,:)
+      real(REAL64), intent(inout) :: var_buffer(:,:,:)
+      integer,      intent(inout) :: num_samples(:)
+      real(REAL64), intent(in)    :: field(:,:,:)
+      integer,      intent(in)    :: col_beg
+      integer,      intent(in)    :: col_end
+      integer,      intent(in)    :: n2, n3
+      logical,      intent(in)    :: flag_xyfill
+      real(REAL64), intent(in)    :: fill_value
+      integer      :: i, ic, k, m
+      real(REAL64) :: fld_val, tmp
+
+      !$acc parallel loop gang vector private(ic, fld_val, tmp) &
+      !$acc   present(data, var_buffer, num_samples, field)
+      do i = col_beg, col_end
+         ic = i - col_beg + 1
+         if (.not. (flag_xyfill .and. field(ic, 1, 1) == fill_value)) then
+            num_samples(i) = num_samples(i) + 1
+         end if
+         !$acc loop seq
+         do k = 1, n2
+            !$acc loop seq
+            do m = 1, n3
+               fld_val = field(ic, k, m)
+               if (flag_xyfill) then
+                  if (fld_val /= fill_value) then
+                     if (num_samples(i) == 1) then
+                        data(i, k, m) = fld_val
+                        var_buffer(i, k, m) = 0.0_REAL64
+                     else
+                        tmp = data(i, k, m)
+                        data(i, k, m) = data(i, k, m) + &
+                                (fld_val - data(i, k, m)) / &
+                                num_samples(i)
+                        var_buffer(i, k, m) = var_buffer(i, k, m) + &
+                                (fld_val - data(i, k, m)) * &
+                                (fld_val - tmp)
+                     end if
+                  end if
+               else
+                  if (num_samples(i) == 1) then
+                     data(i, k, m) = fld_val
+                     var_buffer(i, k, m) = 0.0_REAL64
+                  else
+                     tmp = data(i, k, m)
+                     data(i, k, m) = data(i, k, m) + &
+                             (fld_val - data(i, k, m)) / &
+                             num_samples(i)
+                     var_buffer(i, k, m) = var_buffer(i, k, m) + &
+                             (fld_val - data(i, k, m)) * &
+                             (fld_val - tmp)
+                  end if
+               end if
+            end do
+         end do
+      end do
+
+   end subroutine accum_var_3d_dev
+
+   !#######################################################################
+
+   subroutine check_fill_2d_dev(field, fill_value, bad_col)
+      ! First column (index into <field>) whose elements do not all share
+      ! the fill status of its first element; 0 if none (as buff_2d_check_fill)
+      real(REAL64), intent(in)  :: field(:,:)
+      real(REAL64), intent(in)  :: fill_value
+      integer,      intent(out) :: bad_col
+      integer :: i, k, n1, n2, bad
+      logical :: col_is_fill, inconsistent
+
+      n1 = size(field, 1)
+      n2 = size(field, 2)
+      bad = HUGE(1)
+      !$acc parallel loop gang vector private(col_is_fill, inconsistent) &
+      !$acc   reduction(min:bad) present(field)
+      do i = 1, n1
+         col_is_fill = (field(i, 1) == fill_value)
+         inconsistent = .false.
+         !$acc loop seq
+         do k = 1, n2
+            if ((field(i, k) == fill_value) .neqv. col_is_fill) then
+               inconsistent = .true.
+            end if
+         end do
+         if (inconsistent) then
+            bad = min(bad, i)
+         end if
+      end do
+      if (bad == HUGE(1)) then
+         bad_col = 0
+      else
+         bad_col = bad
+      end if
+
+   end subroutine check_fill_2d_dev
+
+   !#######################################################################
+
+   subroutine check_fill_3d_dev(field, fill_value, bad_col)
+      ! First column (index into <field>) whose elements do not all share
+      ! the fill status of its first element; 0 if none (as buff_3d_check_fill)
+      real(REAL64), intent(in)  :: field(:,:,:)
+      real(REAL64), intent(in)  :: fill_value
+      integer,      intent(out) :: bad_col
+      integer :: i, k, m, n1, n2, n3, bad
+      logical :: col_is_fill, inconsistent
+
+      n1 = size(field, 1)
+      n2 = size(field, 2)
+      n3 = size(field, 3)
+      bad = HUGE(1)
+      !$acc parallel loop gang vector private(col_is_fill, inconsistent) &
+      !$acc   reduction(min:bad) present(field)
+      do i = 1, n1
+         col_is_fill = (field(i, 1, 1) == fill_value)
+         inconsistent = .false.
+         !$acc loop seq
+         do k = 1, n2
+            !$acc loop seq
+            do m = 1, n3
+               if ((field(i, k, m) == fill_value) .neqv. col_is_fill) then
+                  inconsistent = .true.
+               end if
+            end do
+         end do
+         if (inconsistent) then
+            bad = min(bad, i)
+         end if
+      end do
+      if (bad == HUGE(1)) then
+         bad_col = 0
+      else
+         bad_col = bad
+      end if
+
+   end subroutine check_fill_3d_dev
+
+   !#######################################################################
+   ! Plain-array device helpers
+
+   subroutine dev_create_i1(a)
+      integer, intent(inout) :: a(:)
+      !$acc enter data create(a)
+   end subroutine dev_create_i1
+
+   subroutine dev_delete_i1(a)
+      integer, intent(inout) :: a(:)
+      !$acc exit data delete(a)
+   end subroutine dev_delete_i1
+
+   subroutine dev_update_self_i1(a)
+      integer, intent(inout) :: a(:)
+      !$acc update self(a)
+   end subroutine dev_update_self_i1
+
+   subroutine dev_update_device_i1(a)
+      integer, intent(inout) :: a(:)
+      !$acc update device(a)
+   end subroutine dev_update_device_i1
+
+   subroutine dev_zero_i1(a)
+      integer, intent(inout) :: a(:)
+      !$acc kernels present(a)
+      a(:) = 0
+      !$acc end kernels
+   end subroutine dev_zero_i1
+
+   subroutine dev_create_r1(a)
+      real(REAL64), intent(inout) :: a(:)
+      !$acc enter data create(a)
+   end subroutine dev_create_r1
+
+   subroutine dev_delete_r1(a)
+      real(REAL64), intent(inout) :: a(:)
+      !$acc exit data delete(a)
+   end subroutine dev_delete_r1
+
+   subroutine dev_update_self_r1(a)
+      real(REAL64), intent(inout) :: a(:)
+      !$acc update self(a)
+   end subroutine dev_update_self_r1
+
+   subroutine dev_update_device_r1(a)
+      real(REAL64), intent(inout) :: a(:)
+      !$acc update device(a)
+   end subroutine dev_update_device_r1
+
+   subroutine dev_zero_r1(a)
+      real(REAL64), intent(inout) :: a(:)
+      !$acc kernels present(a)
+      a(:) = 0.0_REAL64
+      !$acc end kernels
+   end subroutine dev_zero_r1
+
+   subroutine dev_create_r2(a)
+      real(REAL64), intent(inout) :: a(:,:)
+      !$acc enter data create(a)
+   end subroutine dev_create_r2
+
+   subroutine dev_delete_r2(a)
+      real(REAL64), intent(inout) :: a(:,:)
+      !$acc exit data delete(a)
+   end subroutine dev_delete_r2
+
+   subroutine dev_update_self_r2(a)
+      real(REAL64), intent(inout) :: a(:,:)
+      !$acc update self(a)
+   end subroutine dev_update_self_r2
+
+   subroutine dev_update_device_r2(a)
+      real(REAL64), intent(inout) :: a(:,:)
+      !$acc update device(a)
+   end subroutine dev_update_device_r2
+
+   subroutine dev_zero_r2(a)
+      real(REAL64), intent(inout) :: a(:,:)
+      !$acc kernels present(a)
+      a(:,:) = 0.0_REAL64
+      !$acc end kernels
+   end subroutine dev_zero_r2
+
+   subroutine dev_create_r3(a)
+      real(REAL64), intent(inout) :: a(:,:,:)
+      !$acc enter data create(a)
+   end subroutine dev_create_r3
+
+   subroutine dev_delete_r3(a)
+      real(REAL64), intent(inout) :: a(:,:,:)
+      !$acc exit data delete(a)
+   end subroutine dev_delete_r3
+
+   subroutine dev_update_self_r3(a)
+      real(REAL64), intent(inout) :: a(:,:,:)
+      !$acc update self(a)
+   end subroutine dev_update_self_r3
+
+   subroutine dev_update_device_r3(a)
+      real(REAL64), intent(inout) :: a(:,:,:)
+      !$acc update device(a)
+   end subroutine dev_update_device_r3
+
+   subroutine dev_zero_r3(a)
+      real(REAL64), intent(inout) :: a(:,:,:)
+      !$acc kernels present(a)
+      a(:,:,:) = 0.0_REAL64
+      !$acc end kernels
+   end subroutine dev_zero_r3
+
+#endif
 
    !#######################################################################
 
